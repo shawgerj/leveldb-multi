@@ -129,6 +129,10 @@ static const char* FLAGS_db = nullptr;
 // ZSTD compression level to try out
 static int FLAGS_zstd_compression_level = 1;
 
+// Number of database instances to open
+static int FLAGS_num_instances = 1;
+
+
 namespace leveldb {
 
 namespace {
@@ -429,6 +433,8 @@ class Benchmark {
  private:
   Cache* cache_;
   const FilterPolicy* filter_policy_;
+  int numdbs_;
+  std::vector<DB*> dbs_;
   DB* db_;
   int num_;
   int value_size_;
@@ -523,6 +529,7 @@ class Benchmark {
         filter_policy_(FLAGS_bloom_bits >= 0
                            ? NewBloomFilterPolicy(FLAGS_bloom_bits)
                            : nullptr),
+        numdbs_(FLAGS_num_instances),
         db_(nullptr),
         num_(FLAGS_num),
         value_size_(FLAGS_value_size),
@@ -541,6 +548,7 @@ class Benchmark {
     if (!FLAGS_use_existing_db) {
       DestroyDB(FLAGS_db, Options());
     }
+    dbs_ = std::vector<DB*>(numdbs_);
   }
 
   ~Benchmark() {
@@ -801,6 +809,11 @@ class Benchmark {
 
   void Open() {
     assert(db_ == nullptr);
+    if (numdbs_ != 1) {
+      for (auto db : dbs_) {
+        assert(db == nullptr);
+      }
+    }
     Options options;
     options.env = g_env;
     options.create_if_missing = !FLAGS_use_existing_db;
@@ -816,10 +829,23 @@ class Benchmark {
     options.reuse_logs = FLAGS_reuse_logs;
     options.compression =
         FLAGS_compression ? kSnappyCompression : kNoCompression;
-    Status s = DB::Open(options, FLAGS_db, &db_);
-    if (!s.ok()) {
-      std::fprintf(stderr, "open error: %s\n", s.ToString().c_str());
-      std::exit(1);
+
+    if (numdbs_ == 1) {
+      Status s = DB::Open(options, FLAGS_db, &db_);
+      if (!s.ok()) {
+        std::fprintf(stderr, "open error: %s\n", s.ToString().c_str());
+        std::exit(1);
+      }
+    } else {
+      Status s;
+      for (int i = 0; i < numdbs_; i++) {
+        std::string dbpath = FLAGS_db + std::to_string(i);
+        s = DB::Open(options, FLAGS_db, &dbs_[i]);
+        if (!s.ok()) {
+          std::fprintf(stderr, "open error: %s\n", s.ToString().c_str());
+          std::exit(1);
+        }
+      }
     }
   }
 
@@ -847,16 +873,21 @@ class Benchmark {
     Status s;
     int64_t bytes = 0;
     KeyBuffer key;
-    for (int i = 0; i < num_; i += entries_per_batch_) {
+    int keys_per_db = num_ / numdbs_;
+    // lets just do one key per batch so splitting amongst instances is easier
+    for (int i = 0; i < num_; i += 1) {
       batch.Clear();
-      for (int j = 0; j < entries_per_batch_; j++) {
-        const int k = seq ? i + j : thread->rand.Uniform(FLAGS_num);
-        key.Set(k);
-        batch.Put(key.slice(), gen.Generate(value_size_));
-        bytes += value_size_ + key.slice().size();
-        thread->stats.FinishedSingleOp();
+      const int k = seq ? i : thread->rand.Uniform(FLAGS_num);
+      key.Set(k);
+      batch.Put(key.slice(), gen.Generate(value_size_));
+      bytes += value_size_ + key.slice().size();
+      thread->stats.FinishedSingleOp();
+      if (numdbs_ == 1) {
+        s = db_->Write(write_options_, &batch);
+      } else {
+        int instance = k / keys_per_db;
+        dbs_[instance]->Write(write_options_, &batch);
       }
-      s = db_->Write(write_options_, &batch);
       if (!s.ok()) {
         std::fprintf(stderr, "put error: %s\n", s.ToString().c_str());
         std::exit(1);
@@ -1117,6 +1148,8 @@ int main(int argc, char** argv) {
       FLAGS_open_files = n;
     } else if (strncmp(argv[i], "--db=", 5) == 0) {
       FLAGS_db = argv[i] + 5;
+    } else if (sscanf(argv[i], "--numdbs=%d%c", &n, &junk) == 1) {
+      FLAGS_num_instances = n;
     } else {
       std::fprintf(stderr, "Invalid flag '%s'\n", argv[i]);
       std::exit(1);
